@@ -173,7 +173,7 @@ Resources:
       ExecutionRoleArn: !Ref ECSTaskExecutionRole
       ContainerDefinitions:
         - Name: !Sub '${ProjectName}-container'
-          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}:latest'
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}:placeholder'
           PortMappings:
             - ContainerPort: !Ref ContainerPort
           LogConfiguration:
@@ -189,7 +189,7 @@ Resources:
       ServiceName: !Sub '${ProjectName}-service'
       Cluster: !Ref ECSCluster
       TaskDefinition: !Ref ECSTaskDefinition
-      DesiredCount: 2
+      DesiredCount: 0
       LaunchType: FARGATE
       NetworkConfiguration:
         AwsvpcConfiguration:
@@ -350,7 +350,7 @@ Resources:
       SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*'
 
   # ------------------------------------------------------------#
-  # CodeBuild Project
+  # CodeBuild Projects
   # ------------------------------------------------------------#
   CodeBuildRole:
     Type: AWS::IAM::Role
@@ -411,11 +411,55 @@ Resources:
             Value: !Ref AWS::Region
           - Name: IMAGE_REPO_NAME
             Value: !Ref ECRRepository
-          - Name: IMAGE_TAG
-            Value: 'latest'
+          - Name: PROJECT_NAME
+            Value: !Ref ProjectName
       Source:
         Type: CODEPIPELINE
         BuildSpec: buildspec.yml
+
+  ScaleUpRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-scale-up-policy'
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecs:UpdateService'
+                Resource: !Ref ECSService
+
+  ScaleUpProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-scale-up'
+      ServiceRole: !GetAtt ScaleUpRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: 'aws/codebuild/standard:5.0'
+        EnvironmentVariables:
+          - Name: ECS_CLUSTER_NAME
+            Value: !Ref ECSCluster
+          - Name: ECS_SERVICE_NAME
+            Value: !GetAtt ECSService.Name
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            build:
+              commands:
+                - echo "Scaling up the ECS service to 2 tasks..."
+                - aws ecs update-service --cluster $ECS_CLUSTER_NAME --service $ECS_SERVICE_NAME --desired-count 2 --region $AWS_DEFAULT_REGION
 
   # ------------------------------------------------------------#
   # CodePipeline
@@ -437,13 +481,15 @@ Resources:
                 Action:
                   - 'codebuild:StartBuild'
                   - 'codebuild:BatchGetBuilds'
-                Resource: !GetAtt CodeBuildProject.Arn
+                Resource: 
+                  - !GetAtt CodeBuildProject.Arn
+                  - !GetAtt ScaleUpProject.Arn
               - Effect: Allow
                 Action:
                   - 'ecs:DescribeServices'
                   - 'ecs:UpdateService'
-                Resource: !GetAtt ECSService.Arn
-              # <-- FIX: Corrected PassRole to reference the ECS Task Execution Role, not itself. -->
+                # <-- FIX: Changed !GetAtt ECSService.Arn to !Ref ECSService -->
+                Resource: !Ref ECSService
               - Effect: Allow
                 Action:
                   - 'iam:PassRole'
@@ -512,10 +558,22 @@ Resources:
                 Version: '1'
               Configuration:
                 ClusterName: !Ref ECSCluster
-                ServiceName: !Ref ECSService
+                ServiceName: !GetAtt ECSService.Name
                 FileName: imagedefinitions.json
               InputArtifacts:
                 - Name: BuildOutput
+        - Name: ScaleUp
+          Actions:
+            - Name: ScaleUpAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref ScaleUpProject
+              InputArtifacts:
+                - Name: SourceOutput
 
 Outputs:
   ApiGatewayUrl:
